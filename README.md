@@ -73,7 +73,7 @@ PING
 +PONG
 ```
 
-### Method 1: Using Telnet
+### Method 2: Using Telnet
 
 ```bash
 telnet localhost 6379
