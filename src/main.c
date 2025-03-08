@@ -8,7 +8,7 @@
 #include <arpa/inet.h> 
 #include <pthread.h> // POSIX threads for concurrency 
 
-#define DEFAULT_PORT 6379 //redis standard port 
+#define DEFAULT_PORT 6376 //redis standard port 
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 100
 
@@ -26,35 +26,58 @@ typedef struct {
     struct sockaddr_in address;
 } client_t;
 
-void *handle_client(void *arg) {
+/*Function that handles both the PING and the ECHO commands*/
+void *handle_client(void *arg)
+{
     client_t *client = (client_t *)arg;
     int client_sock = client->socket;
     char buffer[BUFFER_SIZE];
     char client_addr[INET_ADDRSTRLEN];
-    
+
     inet_ntop(AF_INET, &client->address.sin_addr, client_addr, INET_ADDRSTRLEN);
-    printf("New client connected: %s:%d\n", 
-           client_addr, ntohs(client->address.sin_port));
-    
-    while (server_running) {
+    printf("New client connected: %s:%d\n", client_addr, ntohs(client->address.sin_port));
+
+    while (server_running)
+    {
         int bytes_read = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_read <= 0) {
-            printf("Client %s:%d disconnected\n", 
-                   client_addr, ntohs(client->address.sin_port));
+        if (bytes_read <= 0)
+        {
+            printf("Client %s:%d disconnected\n", client_addr, ntohs(client->address.sin_port));
             break;
         }
-        
+
         buffer[bytes_read] = '\0';
-        
-        // simple command handling - just for PING/ping return PONG
-        if (strncmp(buffer, "PING\r\n", 6) == 0 || 
-            strncmp(buffer, "ping\r\n", 6) == 0) {
+        printf("Received: %s\n", buffer); // Debugging print
+
+        // Redis RESP Protocol Handling
+        if (strncmp(buffer, "*1\r\n$4\r\nPING\r\n", 16) == 0)
+        {
+            printf("Responding with PONG\n");
             send(client_sock, "+PONG\r\n", 7, 0);
-        } else {
+        }
+        else if (strncmp(buffer, "*2\r\n$4\r\nECHO\r\n", 13) == 0)
+        {
+            char *arg_start = strstr(buffer, "$");
+            if (arg_start)
+            {
+                int message_length = atoi(arg_start + 1);
+                char *message = strchr(arg_start, '\n');
+                if (message)
+                {
+                    message++; // Move to the actual message
+                    char response[BUFFER_SIZE];
+                    snprintf(response, sizeof(response), "$%d\r\n%s", message_length, message);
+                    send(client_sock, response, strlen(response), 0);
+                }
+            }
+        }
+        else
+        {
+            printf("Unknown command received\n");
             send(client_sock, "-ERR unknown command\r\n", 22, 0);
         }
     }
-    
+
     close(client_sock);
     free(client);
     return NULL;

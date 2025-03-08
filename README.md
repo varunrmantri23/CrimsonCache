@@ -95,3 +95,42 @@ redis-cli -p 6379 ping
 ```
 
 This should return PONG.
+
+
+## Running the C program(main.c)
+
+Open the terminal and execute this to create a crimsoncache execuatle file 
+```bash
+gcc -o crimsoncache main.c -pthread
+```
+Once the executable file is created type 
+```bash
+./crimsomcache
+```
+Open a new terminal and connect to the server using the redis 
+```bash
+redis-cli -p PORT
+```
+
+## RESP format - handle_client()
+- PING command
+Client sends:
+```bash
+*1\r\n$4\r\nPING\r\n
+```
+Server responds:
+```bash
++PONG\r\n
+```
+
+- ECHO command
+Client sends:
+```bash
+*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n
+```
+Server responds
+```bash
+$5\r\nhello\r\n
+```
+
+
