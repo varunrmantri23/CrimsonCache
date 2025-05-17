@@ -95,3 +95,30 @@ redis-cli -p 6379 ping
 ```
 
 This should return PONG.
+
+## Supported Commands
+
+CrimsonCache currently supports the following commands:
+
+### Basic Commands
+- `PING [message]` - Test connectivity, returns PONG or the message if provided
+- `SET key value [EX seconds]` - Set a key to a value with optional expiration
+- `GET key` - Get the value of a key
+- `DEL key [key ...]` - Delete one or more keys
+- `EXISTS key [key ...]` - Check if keys exist
+- `EXPIRE key seconds` - Set a key's time to live in seconds
+- `TTL key` - Get the time to live for a key
+
+## Testing Your Redis-compatible Commands
+
+Since CrimsonCache implements Redis protocol, you can use any Redis client to interact with it:
+
+```bash
+# Using redis-cli
+redis-cli -p 6379 set mykey "Hello World"
+redis-cli -p 6379 get mykey
+
+# Using netcat
+nc localhost 6379
+SET mykey "Hello World"
+GET mykey

@@ -3,22 +3,26 @@
 
 #include <netinet/in.h>
 #include <signal.h>
+#include "dict.h"
 
-// Constants
+// constants
 #define DEFAULT_PORT 6379
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 100
 
-// Client structure
-typedef struct {
-    int socket; //sokcet file descriptor
+// client structure
+typedef struct client {
+    int socket;
     struct sockaddr_in address;
+    char buffer[BUFFER_SIZE];
+    int buffer_pos;
 } client_t;
 
-
-
-// Function prototypes
+// function prototypes
 void handle_signal(int sig);
 void *handle_client(void *arg);
 
-#endif 
+// global dictionary
+extern dict *server_db;
+
+#endif /* CRIMSONCACHE_H */
