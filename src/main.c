@@ -7,10 +7,12 @@
 #include <sys/socket.h> // socket functions (socket, bind, listen, accept)
 #include <arpa/inet.h> 
 #include <pthread.h> // POSIX threads for concurrency 
+#include <time.h> // for time-related functions
+#include "crimsoncache.h"
+#include "commands.h"
 
-#define DEFAULT_PORT 6379 //redis standard port 
-#define BUFFER_SIZE 1024
-#define MAX_CLIENTS 100
+// global dictionary (server database)
+dict *server_db = NULL;
 
 volatile sig_atomic_t server_running = 1;
 
@@ -19,12 +21,18 @@ void handle_signal(int sig) { //signal handler - handles ctrl+c or kill
         printf("\nShutting down server...\n");
         server_running = 0;
     }
-} 
+}
 
-typedef struct {
-    int socket;
-    struct sockaddr_in address;
-} client_t;
+void *cleanup_expired_keys(void *arg) {
+    (void)arg;  // explicitly mark parameter as unused
+    
+    while (server_running) {
+        // clean expired keys every second
+        dict_clear_expired(server_db);
+        sleep(1);
+    }
+    return NULL;
+}
 
 void *handle_client(void *arg) {
     client_t *client = (client_t *)arg;
@@ -46,13 +54,8 @@ void *handle_client(void *arg) {
         
         buffer[bytes_read] = '\0';
         
-        // simple command handling - just for PING/ping return PONG
-        if (strncmp(buffer, "PING\r\n", 6) == 0 || 
-            strncmp(buffer, "ping\r\n", 6) == 0) {
-            send(client_sock, "+PONG\r\n", 7, 0);
-        } else {
-            send(client_sock, "-ERR unknown command\r\n", 22, 0);
-        }
+        // process command using the command module
+        execute_command(client_sock, buffer, server_db);
     }
     
     close(client_sock);
@@ -60,42 +63,59 @@ void *handle_client(void *arg) {
     return NULL;
 }
 
-int main(int argc, char *argv[]) {
+typedef enum {
+    CONCURRENCY_THREADED,  // one thread per client (current)
+    CONCURRENCY_EVENTLOOP  // redis-style event loop - future
+} concurrency_model_t;
+
+// function to parse concurrency model from command line arguments
+concurrency_model_t parse_concurrency_model(int argc, char *argv[]) {
+    if (argc > 2 && strcmp(argv[2], "eventloop") == 0) {
+        return CONCURRENCY_EVENTLOOP;
+    }
+    return CONCURRENCY_THREADED;
+}
+
+// function to run threaded server
+void run_threaded_server() {
     int server_sock, client_sock;
-    struct sockaddr_in server_addr, client_addr;
+    struct sockaddr_in6 server_addr;
+    struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
     int port = DEFAULT_PORT;
     pthread_t thread_id;
     
     // handle command line args for port
-    if (argc > 1) {
-        port = atoi(argv[1]);
-    }
-    
     printf("CrimsonCache starting on port %d\n", port);
     
     // set up signal handling
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     
-    // create server socket
-    if ((server_sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    // create dual-stack socket (IPv6 that also accepts IPv4)
+    if ((server_sock = socket(AF_INET6, SOCK_STREAM, 0)) < 0) {
         perror("Failed to create socket");
         exit(EXIT_FAILURE);
     }
-    
-    // set SO_REUSEADDR option
+
+    // set SO_REUSEADDR to allow rebinding to the port
     int opt = 1;
     if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt failed");
         exit(EXIT_FAILURE);
     }
-    
+
+    // allow IPv4 connections on IPv6 socket (disable IPV6_V6ONLY)
+    int ipv6_only = 0;
+    if (setsockopt(server_sock, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6_only, sizeof(ipv6_only)) < 0) {
+        perror("Warning: Could not set IPV6_V6ONLY option");
+    }
+
     // set up server address
     memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(port);
+    server_addr.sin6_family = AF_INET6;
+    server_addr.sin6_addr = in6addr_any;
+    server_addr.sin6_port = htons(port);
     
     // bind socket
     if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
@@ -110,6 +130,12 @@ int main(int argc, char *argv[]) {
     }
     
     printf("Server is ready to accept connections\n");
+    
+    // start background thread for key expiration
+    pthread_t cleanup_thread;
+    if (pthread_create(&cleanup_thread, NULL, cleanup_expired_keys, NULL) != 0) {
+        perror("Failed to create cleanup thread");
+    }
     
     // accept connections and handle clients
     while (server_running) {
@@ -141,5 +167,32 @@ int main(int argc, char *argv[]) {
     //clean
     close(server_sock);
     printf("Server shutdown complete\n");
+}
+
+// later 
+void run_eventloop_server() {
+    printf("Event loop server is not implemented yet.\n");
+}
+
+int main(int argc, char *argv[]) {
+    // initialize server database
+    server_db = dict_create(1024);
+    if (!server_db) {
+        fprintf(stderr, "Failed to create server database\n");
+        return EXIT_FAILURE;
+    }
+    
+    // parse command line args for model selection
+    concurrency_model_t model = parse_concurrency_model(argc, argv);
+    
+    if (model == CONCURRENCY_THREADED) {
+        run_threaded_server();
+    } else {
+        run_eventloop_server();
+    }
+    
+    // clean up
+    dict_free(server_db);
+    
     return 0;
 }
