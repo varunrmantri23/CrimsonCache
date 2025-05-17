@@ -10,11 +10,25 @@
 #include <time.h> // for time-related functions
 #include "crimsoncache.h"
 #include "commands.h"
+#include "persistence.h"
 
 // global dictionary (server database)
 dict *server_db = NULL;
 
 volatile sig_atomic_t server_running = 1;
+
+// persistence-related global variables
+struct {
+    int changes_since_save;
+    time_t last_save;
+    int save_after_changes;
+    int save_after_seconds;
+} server_persistence = {
+    .changes_since_save = 0,
+    .last_save = 0,
+    .save_after_changes = 1000,  // save after 1000 changes
+    .save_after_seconds = 300    // save every 5 minutes
+};
 
 void handle_signal(int sig) { //signal handler - handles ctrl+c or kill 
     if (sig == SIGINT || sig == SIGTERM) {
@@ -31,6 +45,37 @@ void *cleanup_expired_keys(void *arg) {
         dict_clear_expired(server_db);
         sleep(1);
     }
+    return NULL;
+}
+
+// function to track changes when commands are executed
+void track_command_change() {
+    server_persistence.changes_since_save++;
+}
+
+// function to periodically check if we need to save
+void *auto_save_thread(void *arg) {
+    (void)arg;  // unused parameter
+    
+    while (server_running) {
+        sleep(1);  // check every second
+        
+        time_t now = time(NULL);
+        int time_since_save = now - server_persistence.last_save;
+        
+        if ((server_persistence.changes_since_save >= server_persistence.save_after_changes) ||
+            (time_since_save >= server_persistence.save_after_seconds && server_persistence.changes_since_save > 0)) {
+            
+            printf("auto-saving the database after %d changes and %d seconds...\n", 
+                   server_persistence.changes_since_save, time_since_save);
+            
+            if (save_rdb_to_file(server_db, "dump.rdb")) {
+                server_persistence.changes_since_save = 0;
+                server_persistence.last_save = now;
+            }
+        }
+    }
+    
     return NULL;
 }
 
@@ -56,6 +101,9 @@ void *handle_client(void *arg) {
         
         // process command using the command module
         execute_command(client_sock, buffer, server_db);
+        
+        // track changes for persistence
+        track_command_change();
     }
     
     close(client_sock);
@@ -137,6 +185,12 @@ void run_threaded_server() {
         perror("Failed to create cleanup thread");
     }
     
+    // start auto-save thread
+    pthread_t autosave_thread;
+    if (pthread_create(&autosave_thread, NULL, auto_save_thread, NULL) != 0) {
+        perror("failed to create auto-save thread");
+    }
+    
     // accept connections and handle clients
     while (server_running) {
         client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
@@ -177,9 +231,15 @@ void run_eventloop_server() {
 int main(int argc, char *argv[]) {
     // initialize server database
     server_db = dict_create(1024);
+    server_persistence.last_save = time(NULL);
     if (!server_db) {
         fprintf(stderr, "Failed to create server database\n");
         return EXIT_FAILURE;
+    }
+    
+    // load data from rdb file if it exists
+    if (!load_rdb_from_file(server_db, "dump.rdb")) {
+        fprintf(stderr, "Warning: could not load RDB file, starting with empty DB\n");
     }
     
     // parse command line args for model selection

@@ -49,5 +49,7 @@ cmd_result del_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result exists_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result expire_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result ttl_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result save_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result bgsave_command(int client_sock, int argc, char **argv, dict *db);
 
 #endif /* COMMANDS_H */
