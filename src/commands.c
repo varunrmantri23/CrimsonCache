@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "commands.h"
+#include "persistence.h"
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -42,6 +43,8 @@ static command_def commands[] = {
     {"exists", exists_command, 2, -1},
     {"expire", expire_command, 3, 3},
     {"ttl", ttl_command, 2, 2},
+    {"save", save_command, 1, 1},
+    {"bgsave", bgsave_command, 1, 1},
     {NULL, NULL, 0, 0}  // sentinel to mark end of array
 };
 
@@ -181,6 +184,8 @@ void free_tokens(char **tokens, int count) {
     free(tokens);
 }
 
+extern void track_command_change();
+
 cmd_result execute_command(int client_sock, char *input, dict *db) {
     int argc = 0;
     char **argv = tokenize_command(input, &argc);
@@ -212,6 +217,14 @@ cmd_result execute_command(int client_sock, char *input, dict *db) {
     if (result == CMD_UNKNOWN) {
         reply_error(client_sock, "ERR unknown command");
         result = CMD_ERR;
+    }
+
+    // track changes for write commands 
+    if (result == CMD_OK && (
+        strcasecmp(argv[0], "set") == 0 ||
+        strcasecmp(argv[0], "del") == 0 ||
+        strcasecmp(argv[0], "expire") == 0)) {
+        track_command_change();
     }
     
     free_tokens(argv, argc);
@@ -391,4 +404,37 @@ cmd_result ttl_command(int client_sock, int argc, char **argv, dict *db) {
     long long ttl = (obj->expire - now) / 1000;
     reply_integer(client_sock, ttl);
     return CMD_OK;
+}
+
+cmd_result save_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)argc; // unused
+    (void)argv; // unused
+    
+    printf("Manual SAVE command received, saving database to disk...\n");
+    
+    if (save_rdb_to_file(db, "dump.rdb")) {
+        printf("Manual save completed successfully\n");
+        reply_string(client_sock, "OK");
+        return CMD_OK;
+    } else {
+        fprintf(stderr, "Manual save failed\n");
+        reply_error(client_sock, "ERR failed to save db");
+        return CMD_ERR;
+    }
+}
+
+cmd_result bgsave_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)argc; // unused
+    (void)argv; // unused
+    
+    printf("Manual BGSAVE command received, starting background save...\n");
+    
+    if (background_save(db, "dump.rdb")) {
+        reply_string(client_sock, "Background saving started");
+        return CMD_OK;
+    } else {
+        fprintf(stderr, "Failed to start background save\n");
+        reply_error(client_sock, "ERR failed to start background save");
+        return CMD_ERR;
+    }
 }
