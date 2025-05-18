@@ -11,7 +11,7 @@ TEST_BIN_DIR = $(BIN_DIR)/tests
 
 # Source file handling
 SRC = $(wildcard $(SRC_DIR)/*.c)
-OBJ = $(SRC:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+OBJ = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRC))
 EXECUTABLE = $(BIN_DIR)/crimsoncache
 
 # Test file handling

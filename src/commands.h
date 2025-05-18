@@ -51,5 +51,9 @@ cmd_result expire_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result ttl_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result save_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result bgsave_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result replicaof_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result role_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result incr_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result replconf_command(int client_sock, int argc, char **argv, dict *db);
 
 #endif /* COMMANDS_H */
