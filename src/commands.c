@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "commands.h"
 #include "persistence.h"
+#include "replication.h"
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -9,6 +10,12 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include "crimsoncache.h"
+
+extern void track_command_change(void);
+extern volatile sig_atomic_t server_running;
 
 // fallback implementations if not available
 #ifndef HAVE_STRDUP
@@ -45,6 +52,10 @@ static command_def commands[] = {
     {"ttl", ttl_command, 2, 2},
     {"save", save_command, 1, 1},
     {"bgsave", bgsave_command, 1, 1},
+    {"replicaof", replicaof_command, 3, 3},
+    {"role", role_command, 1, 1},
+    {"incr", incr_command, 2, 2},
+    {"replconf", replconf_command, 2, -1},
     {NULL, NULL, 0, 0}  // sentinel to mark end of array
 };
 
@@ -219,14 +230,23 @@ cmd_result execute_command(int client_sock, char *input, dict *db) {
         result = CMD_ERR;
     }
 
-    // track changes for write commands 
-    if (result == CMD_OK && (
-        strcasecmp(argv[0], "set") == 0 ||
-        strcasecmp(argv[0], "del") == 0 ||
-        strcasecmp(argv[0], "expire") == 0)) {
-        track_command_change();
+    // Add this after applying the commands but before free_tokens
+    // Propagate write commands to replicas
+    if (result == CMD_OK && server_repl.role == ROLE_PRIMARY && client_sock >= 0) {
+        // Commands that modify data
+        if (strcasecmp(argv[0], "set") == 0 ||
+            strcasecmp(argv[0], "del") == 0 ||
+            strcasecmp(argv[0], "expire") == 0 ||
+            strcasecmp(argv[0], "incr") == 0) {
+            
+            // Track for persistence
+            track_command_change();
+            
+            // Propagate to replicas with proper formatting
+            replication_feed_slaves(input, strlen(input));
+        }
     }
-    
+
     free_tokens(argv, argc);
     return result;
 }
@@ -438,3 +458,172 @@ cmd_result bgsave_command(int client_sock, int argc, char **argv, dict *db) {
         return CMD_ERR;
     }
 }
+
+// replicaof command - configure server as replica of another or as primary
+cmd_result replicaof_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)argc; // unused
+    (void)db;   // unused
+
+    // replicaof no one = become primary
+    if (strcasecmp(argv[1], "NO") == 0 && strcasecmp(argv[2], "ONE") == 0) {
+        replication_unset_primary();
+        reply_string(client_sock, "OK");
+        return CMD_OK;
+    }
+
+    // replicaof host port = become replica
+    const char *host = argv[1];
+    int port = atoi(argv[2]);
+    
+    if (port <= 0 || port > 65535) {
+        reply_error(client_sock, "ERR invalid port");
+        return CMD_ERR;
+    }
+    
+    if (replication_set_primary(host, port)) {
+        reply_string(client_sock, "OK");
+        return CMD_OK;
+    } else {
+        reply_error(client_sock, "ERR couldn't connect to primary");
+        return CMD_ERR;
+    }
+}
+
+// role command - return role of server (primary or replica)
+cmd_result role_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)argc; // unused
+    (void)argv; // unused
+    (void)db;   // unused
+    
+    char response[1024];
+    
+    if (server_repl.role == ROLE_PRIMARY) {
+        // format: *3\r\n$6\r\nmaster\r\n:<repl_offset>\r\n*<num_replicas>\r\n...
+        int written = snprintf(response, sizeof(response), 
+                              "*3\r\n$6\r\nmaster\r\n:%lu\r\n*%d\r\n", 
+                              server_repl.repl_offset, 
+                              count_replicas());
+        
+        // add replica info
+        pthread_mutex_lock(&server_repl.replicas_mutex);
+        replica_t *curr = server_repl.replicas;
+        while (curr && written < (int)sizeof(response) - 100) {
+            written += snprintf(response + written, sizeof(response) - written,
+                              "*3\r\n$%zu\r\n%s\r\n:%d\r\n:%ld\r\n",
+                              strlen(curr->ip), curr->ip, curr->port,
+                              time(NULL) - curr->last_ack_time);
+            curr = curr->next;
+        }
+        pthread_mutex_unlock(&server_repl.replicas_mutex);
+        
+    } else {
+        // format: *5\r\n$5\r\nslave\r\n$<host_len>\r\n<host>\r\n:<port>\r\n$<state_len>\r\n<state>\r\n:<offset>\r\n
+        snprintf(response, sizeof(response),
+                "*5\r\n$5\r\nslave\r\n$%zu\r\n%s\r\n:%d\r\n$%zu\r\n%s\r\n:%lu\r\n",
+                strlen(server_repl.primary_host), server_repl.primary_host,
+                server_repl.primary_port,
+                strlen(server_repl.state == REPL_STATE_CONNECTED ? "connected" : "connecting"),
+                server_repl.state == REPL_STATE_CONNECTED ? "connected" : "connecting",
+                server_repl.repl_offset);
+    }
+    
+    write(client_sock, response, strlen(response));
+    return CMD_OK;
+}
+
+// INCR command implementation
+cmd_result incr_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)argc; // unused parameter
+    
+    const char *key = argv[1];
+    
+    // Get current value
+    cc_obj *obj = dict_get(db, key);
+    long long value = 0;
+    
+    if (obj) {
+        // Key exists, check if it's a string we can convert to number
+        if (obj->type != CC_STRING) {
+            reply_error(client_sock, "ERR value is not an integer or out of range");
+            return CMD_ERR;
+        }
+        
+        // Try to parse as integer
+        char *endptr;
+        value = strtoll((char*)obj->ptr, &endptr, 10);
+        
+        if (*endptr != '\0') {
+            reply_error(client_sock, "ERR value is not an integer or out of range");
+            return CMD_ERR;
+        }
+    }
+    
+    // Increment the value
+    value++;
+    
+    // Convert back to string
+    char new_val[32];
+    snprintf(new_val, sizeof(new_val), "%lld", value);
+    
+    // Create new object
+    cc_obj *new_obj = malloc(sizeof(cc_obj));
+    if (!new_obj) {
+        reply_error(client_sock, "ERR out of memory");
+        return CMD_ERR;
+    }
+    
+    new_obj->ptr = strdup(new_val);
+    if (!new_obj->ptr) {
+        free(new_obj);
+        reply_error(client_sock, "ERR out of memory");
+        return CMD_ERR;
+    }
+    
+    new_obj->type = CC_STRING;
+    new_obj->expire = obj ? obj->expire : 0; // Preserve expiry if exists
+    new_obj->size = strlen(new_val) + 1;
+    new_obj->last_access = current_time_ms();
+    
+    if (dict_add(db, key, new_obj)) {
+        reply_integer(client_sock, value);
+        return CMD_OK;
+    } else {
+        free(new_obj->ptr);
+        free(new_obj);
+        reply_error(client_sock, "ERR could not set key");
+        return CMD_ERR;
+    }
+}
+
+// implement the REPLCONF command handler
+cmd_result replconf_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)db; // unused
+    
+    // handle REPLCONF listening-port <port>
+    if (argc >= 3 && strcasecmp(argv[1], "listening-port") == 0) {
+        int port = atoi(argv[2]);
+        
+        printf("Received REPLCONF listening-port %d from replica\n", port);
+        
+        // get client IP address
+        struct sockaddr_in addr;
+        socklen_t addr_len = sizeof(addr);
+        getpeername(client_sock, (struct sockaddr*)&addr, &addr_len);
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &addr.sin_addr, ip, INET_ADDRSTRLEN);
+        
+        // add replica to the list (which will perform initial sync)
+        add_replica(client_sock, ip, port);
+        
+        reply_string(client_sock, "OK");
+        return CMD_OK;
+    }
+    
+    // handle other REPLCONF commands
+    reply_string(client_sock, "OK");
+    return CMD_OK;
+}
+
+
+
+
