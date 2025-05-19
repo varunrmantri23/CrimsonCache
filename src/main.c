@@ -28,6 +28,7 @@ dict *server_db = NULL;
 
 volatile sig_atomic_t server_running = 1;
 
+int server_port = DEFAULT_PORT;
 
 // persistence-related global variables
 struct {
@@ -89,6 +90,9 @@ void *auto_save_thread(void *arg) {
 void *replication_thread(void *arg) {
     (void)arg; // unused parameter
     
+    char buffer[BUFFER_SIZE * 4]; // Larger buffer to handle multiple commands
+    int buffer_pos = 0;
+    
     while (server_running) {
         // handle replica duties
         if (server_repl.role == ROLE_REPLICA) {
@@ -96,19 +100,45 @@ void *replication_thread(void *arg) {
             if (server_repl.state == REPL_STATE_CONNECTED || 
                 server_repl.state == REPL_STATE_SYNC) {
                 
-                char buffer[BUFFER_SIZE];
-                int bytes_read = recv(server_repl.primary_fd, buffer, BUFFER_SIZE - 1, 0);
+                int bytes_read = recv(server_repl.primary_fd, buffer + buffer_pos, 
+                                     BUFFER_SIZE - buffer_pos - 1, 0);
                 
                 if (bytes_read > 0) {
-                    buffer[bytes_read] = '\0';
+                    buffer_pos += bytes_read;
+                    buffer[buffer_pos] = '\0';
                     
-                    // process commands from primary
-                    execute_command(-1, buffer, server_db); // -1 fd means don't send response
+                    // Process buffer line by line
+                    char *line = buffer;
+                    char *next_line;
                     
-                    // update replication state
-                    server_repl.repl_offset += bytes_read;
+                    while ((next_line = strstr(line, "\r\n")) != NULL) {
+                        *next_line = '\0'; // Terminate the current line
+                        
+                        // Skip empty lines
+                        if (strlen(line) > 0) {
+                            // Log the command we're about to execute
+                            printf("Replica executing: %s\n", line);
+                            
+                            // Process this command
+                            execute_command(-1, line, server_db);
+                        }
+                        
+                        // Move to the next line (skip \r\n)
+                        line = next_line + 2;
+                        
+                        // Update offset
+                        server_repl.repl_offset += (next_line + 2 - buffer);
+                    }
                     
-                    // if we were in sync state, move to connected
+                    // Move any incomplete command to the beginning of the buffer
+                    if (line < buffer + buffer_pos) {
+                        buffer_pos = buffer + buffer_pos - line;
+                        memmove(buffer, line, buffer_pos);
+                    } else {
+                        buffer_pos = 0;
+                    }
+                    
+                    // If we were in SYNC state, move to CONNECTED
                     if (server_repl.state == REPL_STATE_SYNC) {
                         server_repl.state = REPL_STATE_CONNECTED;
                         printf("replication: connected to primary\n");
@@ -116,13 +146,13 @@ void *replication_thread(void *arg) {
                 } 
                 else if (bytes_read == 0 || 
                         (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                    // connection closed or error
+                    // Connection closed or error
                     printf("replication: connection to primary lost\n");
                     close(server_repl.primary_fd);
                     server_repl.primary_fd = -1;
                     server_repl.state = REPL_STATE_CONNECTING;
                     
-                    // try to reconnect after a delay
+                    // Try to reconnect after a delay
                     sleep(1);
                     replication_set_primary(server_repl.primary_host, server_repl.primary_port);
                 }
@@ -136,7 +166,7 @@ void *replication_thread(void *arg) {
             }
         }
         
-        // sleep to avoid busy waiting (use standard sleep instead of usleep)
+        // sleep to avoid busy waiting
         struct timespec ts = {0, 100000000}; // 100ms
         nanosleep(&ts, NULL);
     }
@@ -330,6 +360,8 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    server_port = port;
+
     // parse command line args for model selection
     concurrency_model_t model = parse_concurrency_model(argc, argv);
     

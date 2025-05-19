@@ -230,32 +230,23 @@ cmd_result execute_command(int client_sock, char *input, dict *db) {
         result = CMD_ERR;
     }
 
-    // track changes for write commands and propagate to replicas if needed
-    if (result == CMD_OK && (
-        strcasecmp(argv[0], "set") == 0 ||
-        strcasecmp(argv[0], "del") == 0 ||
-        strcasecmp(argv[0], "expire") == 0 ||
-        strcasecmp(argv[0], "incr") == 0)) {
-        
-        track_command_change();
-        
-        // propagate to replicas if we're a primary and this is a client command
-        if (server_repl.role == ROLE_PRIMARY && client_sock >= 0) {
-            // ensure the command ends with \r\n for proper processing
-            char *propagate_cmd;
-            if (input[strlen(input)-1] != '\n') {
-                propagate_cmd = malloc(strlen(input) + 3);
-                if (propagate_cmd) {
-                    sprintf(propagate_cmd, "%s\r\n", input);
-                    replication_feed_slaves(propagate_cmd, strlen(propagate_cmd));
-                    free(propagate_cmd);
-                }
-            } else {
-                replication_feed_slaves(input, strlen(input));
-            }
+    // Add this after applying the commands but before free_tokens
+    // Propagate write commands to replicas
+    if (result == CMD_OK && server_repl.role == ROLE_PRIMARY && client_sock >= 0) {
+        // Commands that modify data
+        if (strcasecmp(argv[0], "set") == 0 ||
+            strcasecmp(argv[0], "del") == 0 ||
+            strcasecmp(argv[0], "expire") == 0 ||
+            strcasecmp(argv[0], "incr") == 0) {
+            
+            // Track for persistence
+            track_command_change();
+            
+            // Propagate to replicas with proper formatting
+            replication_feed_slaves(input, strlen(input));
         }
     }
-    
+
     free_tokens(argv, argc);
     return result;
 }

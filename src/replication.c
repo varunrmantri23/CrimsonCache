@@ -15,6 +15,7 @@
 #include "crimsoncache.h"
 
 extern dict *server_db;
+extern int server_port; 
 
 // get current time in milliseconds
 static uint64_t current_time_ms() {
@@ -44,62 +45,84 @@ void replication_init(void) {
     pthread_mutex_init(&server_repl.replicas_mutex, NULL);
 }
 
-// Add this function after add_replica()
 void sync_replica(int fd) {
-    printf("performing initial sync with replica\n");
+    printf("performing initial sync with replica...\n");
     
-    // create a temporary buffer to hold commands
-    char cmd_buffer[1024];
-    int success_count = 0, error_count = 0;
+    // Stats tracking
+    int total_keys = 0;
+    int synced_keys = 0;
     
-    // iterate through all keys and send SET commands for each one
+    // Buffer for command formatting
+    char cmd_buffer[4096];
+    
+    // Debug output the current database contents
+    printf("primary database contains %zu active entries\n", server_db->used);
+    
+    // Iterate through all hash table buckets
     for (size_t i = 0; i < server_db->size; i++) {
         dict_entry *entry = server_db->table[i];
+        
+        // Process all entries in this bucket
         while (entry) {
-            // skip expired keys
+            // Skip expired keys
             if (entry->val->expire != 0 && entry->val->expire < current_time_ms()) {
                 entry = entry->next;
                 continue;
             }
             
-            // only handle string values for now
+            total_keys++;
+            
+            // Only handle string values for now
             if (entry->val->type == CC_STRING) {
-                // format a SET command
-                snprintf(cmd_buffer, sizeof(cmd_buffer), 
-                         "SET %s %s\r\n", 
-                         entry->key, 
-                         (char*)entry->val->ptr);
+                // Format a SET command with proper quoting for string values
+                int cmd_len;
                 
-                // add debug logging
-                printf("syncing key: [%s] with value: [%s]\n", entry->key, (char*)entry->val->ptr);
-                
-                // send to the replica
-                if (write(fd, cmd_buffer, strlen(cmd_buffer)) != (ssize_t)strlen(cmd_buffer)) {
-                    // write error - replica might be disconnected
-                    printf("error syncing key %s to replica\n", entry->key);
-                    error_count++;
+                // Check if the value needs quoting (contains spaces or special chars)
+                if (strchr((char*)entry->val->ptr, ' ') != NULL || 
+                    strchr((char*)entry->val->ptr, '\t') != NULL ||
+                    strchr((char*)entry->val->ptr, '"') != NULL) {
+                    cmd_len = snprintf(cmd_buffer, sizeof(cmd_buffer), 
+                                     "SET %s \"%s\"\r\n", 
+                                     entry->key, 
+                                     (char*)entry->val->ptr);
                 } else {
-                    success_count++;
+                    cmd_len = snprintf(cmd_buffer, sizeof(cmd_buffer), 
+                                     "SET %s %s\r\n", 
+                                     entry->key, 
+                                     (char*)entry->val->ptr);
                 }
                 
-                // give the replica time to process the command
-                struct timespec ts = {0, 10000000};  // 10ms (0.01s) = 10,000,000 nanoseconds
-                nanosleep(&ts, NULL);  // 10ms delay between commands
+                // Log the exact command we're sending
+                printf("Sending to replica: %s", cmd_buffer);
                 
-                // if this key has an expiration, send EXPIRE command too
-                if (entry->val->expire != 0) {
-                    uint64_t now = current_time_ms();
-                    if (entry->val->expire > now) {
-                        // calculate remaining TTL in seconds
-                        long ttl_sec = (entry->val->expire - now) / 1000;
-                        if (ttl_sec > 0) {
-                            snprintf(cmd_buffer, sizeof(cmd_buffer), 
-                                     "EXPIRE %s %ld\r\n", 
-                                     entry->key, ttl_sec);
-                            write(fd, cmd_buffer, strlen(cmd_buffer));
-                            nanosleep(&ts, NULL);  // 10ms delay
+                // Send to the replica
+                ssize_t written = write(fd, cmd_buffer, cmd_len);
+                if (written == cmd_len) {
+                    synced_keys++;
+                    
+                    // Small delay to allow command to be processed
+                    struct timespec ts = {0, 10000000}; // 10ms
+                    nanosleep(&ts, NULL);
+                    
+                    // If the key has an expiry, send EXPIRE command too
+                    if (entry->val->expire != 0) {
+                        uint64_t now = current_time_ms();
+                        if (entry->val->expire > now) {
+                            long ttl_sec = (entry->val->expire - now) / 1000;
+                            if (ttl_sec > 0) {
+                                cmd_len = snprintf(cmd_buffer, sizeof(cmd_buffer), 
+                                                 "EXPIRE %s %ld\r\n", 
+                                                 entry->key, ttl_sec);
+                                write(fd, cmd_buffer, cmd_len);
+                                
+                                // Small delay for this command too
+                                nanosleep(&ts, NULL);
+                            }
                         }
                     }
+                } else {
+                    fprintf(stderr, "error syncing key %s: wrote %zd of %d bytes\n", 
+                            entry->key, written, cmd_len);
                 }
             }
             
@@ -107,8 +130,7 @@ void sync_replica(int fd) {
         }
     }
     
-    printf("initial sync completed: %d keys synced, %d errors\n", 
-           success_count, error_count);
+    printf("initial sync completed: %d of %d keys synced\n", synced_keys, total_keys);
 }
 
 // add a new replica to the linked list
@@ -248,8 +270,10 @@ int replication_set_primary(const char *host, int port) {
     server_repl.state = REPL_STATE_SYNC;
     
     // send replication command to primary
-    char *cmd = "REPLCONF listening-port 6379\r\n";
-    write(fd, cmd, strlen(cmd));
+    char replconf_cmd[64];
+    snprintf(replconf_cmd, sizeof(replconf_cmd), "REPLCONF listening-port %d\r\n", 
+             server_port);
+    write(fd, replconf_cmd, strlen(replconf_cmd));
     
     // send PSYNC command to request full resync
     char psync_cmd[256];
@@ -276,8 +300,24 @@ void replication_unset_primary(void) {
 void replication_feed_slaves(char *cmd, size_t cmd_len) {
     if (server_repl.role != ROLE_PRIMARY) return;
     
-    // Format cmd in RESP format if needed (client commands are already in text format)
-    // This implementation assumes cmd is already in the right format
+    char *propagate_cmd = cmd;
+    size_t propagate_len = cmd_len;
+    char *temp_cmd = NULL;
+    
+    if (cmd_len < 2 || cmd[cmd_len-2] != '\r' || cmd[cmd_len-1] != '\n') {
+        temp_cmd = malloc(cmd_len + 3);
+        if (temp_cmd) {
+            memcpy(temp_cmd, cmd, cmd_len);
+            temp_cmd[cmd_len] = '\r';
+            temp_cmd[cmd_len + 1] = '\n';
+            temp_cmd[cmd_len + 2] = '\0';
+            propagate_cmd = temp_cmd;
+            propagate_len = cmd_len + 2;
+        }
+    }
+    
+    int to_remove[100] = {0};
+    int remove_count = 0;
     
     pthread_mutex_lock(&server_repl.replicas_mutex);
     
@@ -285,21 +325,21 @@ void replication_feed_slaves(char *cmd, size_t cmd_len) {
     replica_t *next;
     
     while (curr) {
-        next = curr->next; // Save next pointer in case we remove this replica
+        next = curr->next; 
         
-        ssize_t nwritten = write(curr->fd, cmd, cmd_len);
-        if (nwritten != (ssize_t)cmd_len) {
+        ssize_t nwritten = write(curr->fd, propagate_cmd, propagate_len);
+        if (nwritten != (ssize_t)propagate_len) {
             if (nwritten == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                // Would block, try again later
-                fprintf(stderr, "Would block writing to replica (will retry)\n");
+                fprintf(stderr, "would block writing to replica (will retry)\n");
             } else {
-                // Error or connection closed, remove replica
-                fprintf(stderr, "Error writing to replica, removing it\n");
-                remove_replica(curr->fd);
+                fprintf(stderr, "error writing to replica, marking it for removal\n");
+                if (remove_count < 100) {
+                    to_remove[remove_count++] = curr->fd;
+                }
             }
         } else {
-            // Update replication offset
-            server_repl.repl_offset += cmd_len;
+            // update replication offset
+            server_repl.repl_offset += propagate_len;
             curr->last_ack_time = time(NULL);
         }
         
@@ -307,6 +347,15 @@ void replication_feed_slaves(char *cmd, size_t cmd_len) {
     }
     
     pthread_mutex_unlock(&server_repl.replicas_mutex);
+    
+    // Now remove any marked replicas after releasing the mutex
+    for (int i = 0; i < remove_count; i++) {
+        remove_replica(to_remove[i]);
+    }
+    
+    if (temp_cmd) {
+        free(temp_cmd);
+    }
 }
 
 // get replication info for the INFO command
