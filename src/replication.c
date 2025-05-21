@@ -100,7 +100,6 @@ void sync_replica(int fd) {
                 if (written == cmd_len) {
                     synced_keys++;
                     
-                    // Small delay to allow command to be processed
                     struct timespec ts = {0, 10000000}; // 10ms
                     nanosleep(&ts, NULL);
                     

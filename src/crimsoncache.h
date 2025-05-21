@@ -16,11 +16,20 @@ typedef struct client {
     struct sockaddr_in address;
     char buffer[BUFFER_SIZE];
     int buffer_pos;
+    
+    int in_transaction;          // flag to indicate if in MULTI state
+    int transaction_errors;      // tracks if any errors occurred during MULTI
+    char **queued_commands;     
+    int queue_size;              // current size of queue
+    int queue_capacity;          // allocated capacity of queue
 } client_t;
 
 // function prototypes
 void handle_signal(int sig);
 void *handle_client(void *arg);
+void register_client(client_t *client);
+void unregister_client(client_t *client);
+client_t *get_client_by_socket(int socket);
 
 // global dictionary
 extern dict *server_db;

@@ -15,7 +15,39 @@
 #include "commands.h"
 #include "persistence.h"
 #include "replication.h"
+#include "transaction.h"
 
+// #define MAX_CLIENTS 1000
+client_t *client_list[MAX_CLIENTS];
+
+void register_client(client_t *client) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (client_list[i] == NULL) {
+            client_list[i] = client;
+            tx_init(client); // Initialize transaction state
+            break;
+        }
+    }
+}
+
+void unregister_client(client_t *client) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (client_list[i] == client) {
+            tx_cleanup(client); // Clean up transaction resources
+            client_list[i] = NULL;
+            break;
+        }
+    }
+}
+
+client_t *get_client_by_socket(int socket) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (client_list[i] && client_list[i]->socket == socket) {
+            return client_list[i];
+        }
+    }
+    return NULL;
+}
 
 // function prototypes for background threads
 void *cleanup_expired_keys(void *arg);
@@ -88,9 +120,9 @@ void *auto_save_thread(void *arg) {
 
 // thread to handle replication tasks
 void *replication_thread(void *arg) {
-    (void)arg; // unused parameter
+    (void)arg;
     
-    char buffer[BUFFER_SIZE * 4]; // Larger buffer to handle multiple commands
+    char buffer[BUFFER_SIZE * 4]; // buffer for incoming data
     int buffer_pos = 0;
     
     while (server_running) {
@@ -190,6 +222,8 @@ void *handle_client(void *arg) {
     printf("new client connected: %s:%d\n", 
            client_addr, ntohs(client->address.sin_port));
     
+    register_client(client);
+    
     while (server_running) {
         int bytes_read = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
         if (bytes_read <= 0) {
@@ -200,10 +234,10 @@ void *handle_client(void *arg) {
         
         buffer[bytes_read] = '\0';
         
-        // process command using the command module
         execute_command(client_sock, buffer, server_db);
     }
     
+    unregister_client(client);
     close(client_sock);
     free(client);
     return NULL;
