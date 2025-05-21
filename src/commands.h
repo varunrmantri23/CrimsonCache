@@ -55,5 +55,8 @@ cmd_result replicaof_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result role_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result incr_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result replconf_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result multi_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result exec_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result discard_command(int client_sock, int argc, char **argv, dict *db);
 
 #endif /* COMMANDS_H */

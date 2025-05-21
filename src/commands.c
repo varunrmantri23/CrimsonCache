@@ -13,9 +13,11 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include "crimsoncache.h"
+#include "transaction.h" 
 
 extern void track_command_change(void);
 extern volatile sig_atomic_t server_running;
+extern client_t *get_client_by_socket(int socket);
 
 // fallback implementations if not available
 #ifndef HAVE_STRDUP
@@ -56,6 +58,9 @@ static command_def commands[] = {
     {"role", role_command, 1, 1},
     {"incr", incr_command, 2, 2},
     {"replconf", replconf_command, 2, -1},
+    {"multi", multi_command, 1, 1},
+    {"exec", exec_command, 1, 1},
+    {"discard", discard_command, 1, 1},
     {NULL, NULL, 0, 0}  // sentinel to mark end of array
 };
 
@@ -197,58 +202,102 @@ void free_tokens(char **tokens, int count) {
 
 extern void track_command_change();
 
+// this is where we figure out what the client wants to do
 cmd_result execute_command(int client_sock, char *input, dict *db) {
-    int argc = 0;
-    char **argv = tokenize_command(input, &argc);
-    cmd_result result = CMD_UNKNOWN;
-    
-    if (!argv || argc == 0) {
-        if (argv) free_tokens(argv, argc);
-        reply_error(client_sock, "ERR empty command");
+    int argc = 0; // to count how many parts the command has
+    char *input_copy = strdup(input); // make a copy so strtok doesn't mess up the original
+    if (!input_copy) {
+        // oops, couldn't make a copy, something's wrong
+        if (client_sock >= 0) {
+            reply_error(client_sock, "err out of memory");
+        }
         return CMD_ERR;
     }
-    
-    for (size_t i = 0; i < strlen(argv[0]); i++) {
-        argv[0][i] = tolower(argv[0][i]);
-    }
-    for (int i = 0; commands[i].name != NULL; i++) {
-        if (strcmp(argv[0], commands[i].name) == 0) {
-            // check argument count
-            if ((commands[i].min_args > 0 && argc < commands[i].min_args) ||
-                (commands[i].max_args > 0 && argc > commands[i].max_args)) {
-                reply_error(client_sock, "ERR wrong number of arguments");
-                result = CMD_ERR;
-            } else {
-                result = commands[i].handler(client_sock, argc, argv, db);
-            }
-            break;
+
+    char **argv = tokenize_command(input_copy, &argc); // break the command into pieces
+    cmd_result result = CMD_UNKNOWN; // let's assume we don't know the command yet
+
+    // if we didn't get any pieces, or something went wrong tokenizing
+    if (!argv || argc == 0) {
+        if (argv) free_tokens(argv, argc); // clean up if argv was allocated
+        free(input_copy); // clean up the copy
+        if (client_sock >= 0) {
+            reply_error(client_sock, "err empty command");
         }
-    }
-    
-    if (result == CMD_UNKNOWN) {
-        reply_error(client_sock, "ERR unknown command");
-        result = CMD_ERR;
+        return CMD_ERR;
     }
 
-    // Add this after applying the commands but before free_tokens
-    // Propagate write commands to replicas
-    if (result == CMD_OK && server_repl.role == ROLE_PRIMARY && client_sock >= 0) {
-        // Commands that modify data
+    // make the command name lowercase so "SET" and "set" are the same
+    for (size_t i = 0; argv[0][i]; i++) {
+        argv[0][i] = tolower(argv[0][i]);
+    }
+
+    // see if this client is in a transaction
+    client_t *client = client_sock >= 0 ? get_client_by_socket(client_sock) : NULL;
+
+    // is this a command that controls transactions, like multi, exec, or discard?
+    int is_tx_command = strcmp(argv[0], "multi") == 0 ||
+                        strcmp(argv[0], "exec") == 0 ||
+                        strcmp(argv[0], "discard") == 0;
+
+    // if we're in a transaction and this isn't a transaction control command, just queue it
+    if (client && client->in_transaction && !is_tx_command) {
+        // use the original input string for queuing to preserve quotes and stuff
+        if (tx_queue_command(client, input)) {
+            reply_string(client_sock, "queued");
+        } else {
+            reply_error(client_sock, "err queue command failed");
+            client->transaction_errors = 1; // mark that something went wrong
+        }
+        free_tokens(argv, argc); // clean up the pieces
+        free(input_copy); // clean up the copy
+        return CMD_OK; // we're done for now, it's queued
+    }
+
+    // okay, not queuing, let's find the actual command to run
+    for (int i = 0; commands[i].name != NULL; i++) {
+        if (strcmp(argv[0], commands[i].name) == 0) {
+            // found it! now check if they gave the right number of arguments
+            if ((commands[i].min_args > 0 && argc < commands[i].min_args) ||
+                (commands[i].max_args > 0 && argc > commands[i].max_args && commands[i].max_args != -1)) { // -1 means any number of args is fine
+                if (client_sock >= 0) {
+                    reply_error(client_sock, "err wrong number of arguments");
+                }
+                result = CMD_ERR;
+            } else {
+                // looks good, run the command's handler function
+                result = commands[i].handler(client_sock, argc, argv, db);
+            }
+            break; // no need to check other commands
+        }
+    }
+
+    // if we went through all commands and didn't find it
+    if (result == CMD_UNKNOWN) {
+        if (client_sock >= 0) { // only send error if it's a real client connection
+            reply_error(client_sock, "err unknown command");
+        }
+        result = CMD_ERR; // make sure we return an error status
+    }
+
+    // if the command was okay, and we're the primary server, and it was a write command...
+    // then we need to tell our replicas about it
+    // but only if we're not in a transaction (exec will handle propagation for transactions)
+    if (result == CMD_OK && (!client || !client->in_transaction) && server_repl.role == ROLE_PRIMARY && client_sock >= 0) {
         if (strcasecmp(argv[0], "set") == 0 ||
             strcasecmp(argv[0], "del") == 0 ||
             strcasecmp(argv[0], "expire") == 0 ||
             strcasecmp(argv[0], "incr") == 0) {
-            
-            // Track for persistence
-            track_command_change();
-            
-            // Propagate to replicas with proper formatting
+
+            track_command_change(); // for persistence, like auto-saving
+            // use the original input for replication to keep quotes and exact format
             replication_feed_slaves(input, strlen(input));
         }
     }
 
-    free_tokens(argv, argc);
-    return result;
+    free_tokens(argv, argc); // always clean up the token pieces
+    free(input_copy); // and the copy we made
+    return result; // tell the caller how it went
 }
 
 // response formatters
@@ -621,6 +670,78 @@ cmd_result replconf_command(int client_sock, int argc, char **argv, dict *db) {
     
     // handle other REPLCONF commands
     reply_string(client_sock, "OK");
+    return CMD_OK;
+}
+
+// MULTI command - begin transaction
+cmd_result multi_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)argc;
+    (void)argv;
+    (void)db; 
+    
+    client_t *client = get_client_by_socket(client_sock);
+    if (!client) {
+        reply_error(client_sock, "ERR client not found");
+        return CMD_ERR;
+    }
+    
+    if (client->in_transaction) {
+        reply_error(client_sock, "ERR MULTI calls can not be nested");
+        return CMD_ERR;
+    }
+    
+    client->in_transaction = 1;
+    client->transaction_errors = 0;
+    reply_string(client_sock, "OK");
+    return CMD_OK;
+}
+
+// EXEC command - execute transaction
+cmd_result exec_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)argc;
+    (void)argv;
+    
+    client_t *client = get_client_by_socket(client_sock);
+    if (!client) {
+        reply_error(client_sock, "ERR client not found");
+        return CMD_ERR;
+    }
+    
+    if (!client->in_transaction) {
+        reply_error(client_sock, "ERR EXEC without MULTI");
+        return CMD_ERR;
+    }
+    
+    printf("Executing transaction with %d commands\n", client->queue_size);
+    tx_execute_commands(client, db);
+    
+    if (client->in_transaction != 0) {
+        printf("WARNING: Transaction state not properly reset, forcing to 0\n");
+        client->in_transaction = 0;
+    }
+    
+    printf("Transaction execution complete, in_transaction=%d\n", client->in_transaction);
+    return CMD_OK;
+}
+
+// DISCARD command - discard transaction
+cmd_result discard_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)argc; 
+    (void)argv; 
+    (void)db;   
+    
+    client_t *client = get_client_by_socket(client_sock);
+    if (!client) {
+        reply_error(client_sock, "ERR client not found");
+        return CMD_ERR;
+    }
+    
+    if (!client->in_transaction) {
+        reply_error(client_sock, "ERR DISCARD without MULTI");
+        return CMD_ERR;
+    }
+    
+    tx_discard_commands(client);
     return CMD_OK;
 }
 
