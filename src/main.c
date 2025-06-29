@@ -16,22 +16,31 @@
 #include "persistence.h"
 #include "replication.h"
 #include "transaction.h"
+#include "pubsub.h"
+#include "config.h"
+#include "eventloop.h"
 
-// #define MAX_CLIENTS 1000
-client_t *client_list[MAX_CLIENTS];
+// max_clients is now configured via crimsoncache.conf
+client_t **client_list;
+
+// global variables for persistence, now configured via config.h
+struct {
+    int changes_since_save;
+    time_t last_save;
+} server_persistence;
 
 void register_client(client_t *client) {
-    for (int i = 0; i < MAX_CLIENTS; i++) {
+    for (int i = 0; i < config.max_clients; i++) {
         if (client_list[i] == NULL) {
             client_list[i] = client;
-            tx_init(client); // Initialize transaction state
+            // tx_init(client); // Initialized when client_t is created
             break;
         }
     }
 }
 
 void unregister_client(client_t *client) {
-    for (int i = 0; i < MAX_CLIENTS; i++) {
+    for (int i = 0; i < config.max_clients; i++) {
         if (client_list[i] == client) {
             tx_cleanup(client); // Clean up transaction resources
             client_list[i] = NULL;
@@ -41,7 +50,7 @@ void unregister_client(client_t *client) {
 }
 
 client_t *get_client_by_socket(int socket) {
-    for (int i = 0; i < MAX_CLIENTS; i++) {
+    for (int i = 0; i < config.max_clients; i++) {
         if (client_list[i] && client_list[i]->socket == socket) {
             return client_list[i];
         }
@@ -49,7 +58,7 @@ client_t *get_client_by_socket(int socket) {
     return NULL;
 }
 
-// function prototypes for background threads
+// background thread function prototypes
 void *cleanup_expired_keys(void *arg);
 void *auto_save_thread(void *arg);
 void *replication_thread(void *arg);
@@ -59,28 +68,13 @@ void track_command_change(void);
 dict *server_db = NULL;
 
 volatile sig_atomic_t server_running = 1;
-
-int server_port = DEFAULT_PORT;
-
-// persistence-related global variables
-struct {
-    int changes_since_save;
-    time_t last_save;
-    int save_after_changes;
-    int save_after_seconds;
-} server_persistence = {
-    .changes_since_save = 0,
-    .last_save = 0,
-    .save_after_changes = 1000,  // save after 1000 changes
-    .save_after_seconds = 300    // save every 5 minutes
-};
 void handle_signal(int sig) {
     if (sig == SIGINT || sig == SIGTERM) {
         printf("\nshutting down server...\n");
         server_running = 0;
     }
 }
-// thread to clean expired keys from database
+// thread for cleaning expired keys from the database
 void *cleanup_expired_keys(void *arg) {
     (void)arg; // unused parameter
     
@@ -92,7 +86,7 @@ void *cleanup_expired_keys(void *arg) {
     return NULL;
 }
 
-// thread to auto-save the database
+// thread for auto-saving the database
 void *auto_save_thread(void *arg) {
     (void)arg; // unused parameter
     
@@ -101,9 +95,9 @@ void *auto_save_thread(void *arg) {
         
         time_t now = time(NULL);
         int time_since_save = now - server_persistence.last_save;
-        
-        if ((server_persistence.changes_since_save >= server_persistence.save_after_changes) ||
-            (time_since_save >= server_persistence.save_after_seconds && server_persistence.changes_since_save > 0)) {
+
+        if ((config.save_after_changes > 0 && server_persistence.changes_since_save >= config.save_after_changes) ||
+            (config.save_after_seconds > 0 && time_since_save >= config.save_after_seconds && server_persistence.changes_since_save > 0)) {
             
             printf("auto-saving the database after %d changes and %d seconds...\n", 
                    server_persistence.changes_since_save, time_since_save);
@@ -118,11 +112,11 @@ void *auto_save_thread(void *arg) {
     return NULL;
 }
 
-// thread to handle replication tasks
+// thread for handling replication tasks
 void *replication_thread(void *arg) {
     (void)arg;
     
-    char buffer[BUFFER_SIZE * 4]; // buffer for incoming data
+    char buffer[config.buffer_size * 4]; // buffer for incoming data
     int buffer_pos = 0;
     
     while (server_running) {
@@ -133,7 +127,7 @@ void *replication_thread(void *arg) {
                 server_repl.state == REPL_STATE_SYNC) {
                 
                 int bytes_read = recv(server_repl.primary_fd, buffer + buffer_pos, 
-                                     BUFFER_SIZE - buffer_pos - 1, 0);
+                                     config.buffer_size - buffer_pos - 1, 0);
                 
                 if (bytes_read > 0) {
                     buffer_pos += bytes_read;
@@ -211,61 +205,61 @@ void track_command_change(void) {
     server_persistence.changes_since_save++;
 }
 
-// handles client connections
+// handles client connections in threaded model
 void *handle_client(void *arg) {
     client_t *client = (client_t *)arg;
     int client_sock = client->socket;
-    char buffer[BUFFER_SIZE];
-    char client_addr[INET_ADDRSTRLEN];
+    char client_ip_str[INET6_ADDRSTRLEN];
     
-    inet_ntop(AF_INET, &client->address.sin_addr, client_addr, INET_ADDRSTRLEN);
-    printf("new client connected: %s:%d\n", 
-           client_addr, ntohs(client->address.sin_port));
+    if (client->address.ss_family == AF_INET) {
+        struct sockaddr_in *s = (struct sockaddr_in *)&client->address;
+        inet_ntop(AF_INET, &s->sin_addr, client_ip_str, sizeof(client_ip_str));
+        printf("new client connected: %s:%d\n", 
+               client_ip_str, ntohs(s->sin_port));
+    } else if (client->address.ss_family == AF_INET6) {
+        struct sockaddr_in6 *s = (struct sockaddr_in6 *)&client->address;
+        inet_ntop(AF_INET6, &s->sin6_addr, client_ip_str, sizeof(client_ip_str));
+        printf("new client connected: %s:%d\n", 
+               client_ip_str, ntohs(s->sin6_port));
+    } else {
+        printf("new client connected: unknown address family\n");
+    }
     
     register_client(client);
     
     while (server_running) {
-        int bytes_read = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
+        int bytes_read = recv(client_sock, client->buffer + client->buffer_pos, client->buffer_capacity - client->buffer_pos - 1, 0);
         if (bytes_read <= 0) {
             printf("client %s:%d disconnected\n", 
-                   client_addr, ntohs(client->address.sin_port));
+                   client_ip_str, 
+                   (client->address.ss_family == AF_INET) ? ntohs(((struct sockaddr_in *)&client->address)->sin_port) : ntohs(((struct sockaddr_in6 *)&client->address)->sin6_port));
             break;
         }
         
-        buffer[bytes_read] = '\0';
+        client->buffer_pos += bytes_read;
+        client->buffer[client->buffer_pos] = '\0';
         
-        execute_command(client_sock, buffer, server_db);
+        execute_command(client_sock, client->buffer, server_db);
+        client->buffer_pos = 0; // reset buffer for next command
     }
-    
+    pubsub_remove_client(client);
     unregister_client(client);
     close(client_sock);
+    free(client->buffer);
     free(client);
     return NULL;
-}
-
-typedef enum {
-    CONCURRENCY_THREADED,  // one thread per client (current)
-    CONCURRENCY_EVENTLOOP  // redis-style event loop - future
-} concurrency_model_t;
-
-// function to parse concurrency model from command line arguments
-concurrency_model_t parse_concurrency_model(int argc, char *argv[]) {
-    if (argc > 2 && strcmp(argv[2], "eventloop") == 0) {
-        return CONCURRENCY_EVENTLOOP;
-    }
-    return CONCURRENCY_THREADED;
 }
 
 // function to run threaded server with custom port
 void run_threaded_server(int port) {
     int server_sock, client_sock;
     struct sockaddr_in6 server_addr;
-    struct sockaddr_in client_addr;
+    struct sockaddr_storage client_addr; // Use sockaddr_storage for client_addr - handles both IPv4 and IPv6 well
     socklen_t client_len = sizeof(client_addr);
     pthread_t thread_id;
     
     // now using the provided port parameter
-    printf("CrimsonCache starting on port %d\n", port);
+    printf("CrimsonCache starting on port %d using threaded model\n", port);
     
     // set up signal handling
     signal(SIGINT, handle_signal);
@@ -303,7 +297,7 @@ void run_threaded_server(int port) {
     }
     
     // listen for connections
-    if (listen(server_sock, MAX_CLIENTS) < 0) {
+    if (listen(server_sock, config.max_clients) < 0) {
         perror("Listen failed");
         exit(EXIT_FAILURE);
     }
@@ -339,16 +333,29 @@ void run_threaded_server(int port) {
         
         client_t *client = (client_t *)malloc(sizeof(client_t));
         if (client == NULL) {
-            perror("Failed to allocate memory for client");
+            perror("failed to allocate memory for client");
             close(client_sock);
             continue;
         }
         
         client->socket = client_sock;
-        client->address = client_addr;
+        // copy client address information
+        memcpy(&client->address, &client_addr, client_len);
+        client->addr_len = client_len;
+        client->buffer_pos = 0; // initialize buffer position
+        client->buffer = (char *)malloc(config.buffer_size);
+        if (client->buffer == NULL) {
+            perror("failed to allocate client buffer");
+            free(client);
+            close(client_sock);
+            continue;
+        }
+        client->buffer_capacity = config.buffer_size;
+        tx_init(client); // initialize transaction state
         
         if (pthread_create(&thread_id, NULL, handle_client, (void *)client) != 0) {
             perror("Failed to create thread");
+            free(client->buffer);
             free(client);
             close(client_sock);
         } else {
@@ -361,20 +368,114 @@ void run_threaded_server(int port) {
     printf("Server shutdown complete\n");
 }
 
-// later 
-void run_eventloop_server() {
-    printf("Event loop server is not implemented yet.\n");
+
+// run the server using the event loop model
+void run_eventloop_server(int port) {
+    int server_sock;
+    struct sockaddr_in6 server_addr;
+    event_loop_t loop;
+
+    printf("CrimsonCache starting on port %d using eventloop model\n", port);
+
+    // Basic server setup (socket, bind, listen)
+    if ((server_sock = socket(AF_INET6, SOCK_STREAM, 0)) < 0) {
+        perror("Failed to create socket");
+        return;
+    }
+
+    int opt = 1;
+    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    int ipv6_only = 0;
+    setsockopt(server_sock, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6_only, sizeof(ipv6_only));
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin6_family = AF_INET6;
+    server_addr.sin6_addr = in6addr_any;
+    server_addr.sin6_port = htons(port);
+
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        close(server_sock);
+        return;
+    }
+
+    if (listen(server_sock, config.max_clients) < 0) {
+        perror("Listen failed");
+        close(server_sock);
+        return;
+    }
+
+    // Initialize and run the event loop
+    if (event_loop_init(&loop) != 0) {
+        fprintf(stderr, "Failed to initialize event loop\n");
+        close(server_sock);
+        return;
+    }
+
+    // The background threads are still managed by main
+    event_loop_run(&loop, server_sock);
+
+    // Cleanup
+    event_loop_cleanup(&loop);
+    close(server_sock);
+    printf("Server shutdown complete\n");
 }
 
 int main(int argc, char *argv[]) {
+    // load default configuration
+    load_default_config();
+
+    // handle command line arguments
+    if (argc > 1) {
+        // check if the argument is a port number
+        char *endptr;
+        long arg_port = strtol(argv[1], &endptr, 10);
+        if (*endptr == '\0' && arg_port > 0 && arg_port <= 65535) {
+            // it's a valid port number, override default port
+            config.port = (int)arg_port;
+            fprintf(stderr, "info: starting on port %d as specified by command line argument.\n", config.port);
+        } else {
+            // it's not a port number, treat it as a config file path
+            const char *config_file = argv[1];
+            // check if config file exists
+            if (access(config_file, F_OK) == -1) {
+                fprintf(stderr, "warning: config file '%s' not found. using default settings.\n", config_file);
+                fprintf(stderr, "you can create a '%s' file to customize settings.\n", config_file);
+            } else {
+                load_config_from_file(config_file);
+            }
+        }
+    } else {
+        // no command line arguments, try to load default config file
+        const char *default_config_file = "crimsoncache.conf";
+        if (access(default_config_file, F_OK) == -1) {
+            fprintf(stderr, "warning: config file '%s' not found. using default settings.\n", default_config_file);
+            fprintf(stderr, "you can create a '%s' file to customize settings.\n", default_config_file);
+        } else {
+            load_config_from_file(default_config_file);
+        }
+    }
+
     // initialize server database
+
+
     server_db = dict_create(1024);
     if (!server_db) {
         fprintf(stderr, "failed to create server database\n");
         return EXIT_FAILURE;
     }
     
-    // initialize last_save time to current time
+    // allocate client list based on configured max_clients
+    client_list = (client_t **)calloc(config.max_clients, sizeof(client_t *));
+    if (!client_list) {
+        fprintf(stderr, "failed to allocate client list\n");
+        dict_free(server_db);
+        return EXIT_FAILURE;
+    }
+    
+    // initialize persistence state
+    server_persistence.changes_since_save = 0;
     server_persistence.last_save = time(NULL);
     
     // initialize replication
@@ -385,29 +486,32 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "warning: could not load rdb file, starting with empty db\n");
     }
     
-    // parse port from command line args
-    int port = DEFAULT_PORT;
-    for (int i = 1; i < argc - 1; i++) {
-        if (strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-p") == 0) {
-            port = atoi(argv[i + 1]);
-            break;
-        }
-    }
+    // initialize pub/sub
+    pubsub_init();
     
-    server_port = port;
+    // start background threads
+    pthread_t cleanup_thread, autosave_thread, repl_thread;
+    pthread_create(&cleanup_thread, NULL, cleanup_expired_keys, NULL);
+    pthread_create(&autosave_thread, NULL, auto_save_thread, NULL);
+    pthread_create(&repl_thread, NULL, replication_thread, NULL);
 
-    // parse command line args for model selection
-    concurrency_model_t model = parse_concurrency_model(argc, argv);
-    
-    if (model == CONCURRENCY_THREADED) {
-        run_threaded_server(port);  // pass the port 
+    // select and run the server based on the configured concurrency model
+    if (config.concurrency_model == CONCURRENCY_THREADED) {
+        run_threaded_server(config.port);
     } else {
-        run_eventloop_server();
+        run_eventloop_server(config.port);
     }
+
+    // Wait for background threads to finish (optional, for clean shutdown)
+    pthread_join(cleanup_thread, NULL);
+    pthread_join(autosave_thread, NULL);
+    pthread_join(repl_thread, NULL);
     
     // clean up
     dict_free(server_db);
+    free(client_list);
     replication_cleanup();
+    pubsub_cleanup();
     
     return 0;
 }

@@ -4,17 +4,18 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include "dict.h"
+#include "config.h"
 
 // constants
 #define DEFAULT_PORT 6379
-#define BUFFER_SIZE 1024
-#define MAX_CLIENTS 100
 
 // client structure
 typedef struct client {
     int socket;
-    struct sockaddr_in address;
-    char buffer[BUFFER_SIZE];
+    struct sockaddr_storage address; // use sockaddr_storage for ipv4/ipv6 compatibility
+    socklen_t addr_len; // store the actual length of the address
+    char *buffer;
+    size_t buffer_capacity;
     int buffer_pos;
     
     int in_transaction;          // flag to indicate if in MULTI state

@@ -13,9 +13,9 @@
 #include <time.h>
 #include <sys/time.h>
 #include "crimsoncache.h"
+#include "config.h"
 
-extern dict *server_db;
-extern int server_port; 
+extern dict *server_db; 
 
 // get current time in milliseconds
 static uint64_t current_time_ms() {
@@ -269,9 +269,7 @@ int replication_set_primary(const char *host, int port) {
     server_repl.state = REPL_STATE_SYNC;
     
     // send replication command to primary
-    char replconf_cmd[64];
-    snprintf(replconf_cmd, sizeof(replconf_cmd), "REPLCONF listening-port %d\r\n", 
-             server_port);
+    char replconf_cmd[64];    snprintf(replconf_cmd, sizeof(replconf_cmd), "REPLCONF listening-port %d\r\n",              config.port);
     write(fd, replconf_cmd, strlen(replconf_cmd));
     
     // send PSYNC command to request full resync

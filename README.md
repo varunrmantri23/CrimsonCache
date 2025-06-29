@@ -50,9 +50,40 @@ make
 
 ## Usage
 
+To compile the project, navigate to the project root and run `make`:
+```bash
+make
+```
+
+To run the server:
+
+**Using default configuration:**
 ```bash
 ./bin/crimsoncache
 ```
+This will start the server using the default settings. If `crimsoncache.conf` is not found in the current directory, default settings will be applied, and a warning message will be displayed.
+
+**Using a custom configuration file:**
+```bash
+./bin/crimsoncache /path/to/your/custom.conf
+```
+
+## Configuration
+
+CrimsonCache can be configured via the `crimsoncache.conf` file in the project root. This file allows you to customize various server settings.
+
+### Available Configuration Options:
+
+*   `port <number>`: Sets the port the server listens on (default: `6379`).
+*   `concurrency <model>`: Sets the concurrency model. Options:
+    *   `threaded` (default): Uses a new thread for each client connection. Simple, but less scalable for many concurrent clients.
+    *   `eventloop`: Uses a single-threaded event loop with `epoll` (Linux-specific) for high-performance I/O multiplexing. Recommended for production-like environments.
+*   `maxClients <number>`: Sets the maximum number of concurrent clients the server can handle (default: `100`).
+*   `logFile <path>`: Sets the path for the server's log file (default: `crimsoncache.log`).
+*   `saveSeconds <number>`: Sets the time in seconds after which the database is automatically saved if changes occurred (default: `300`).
+*   `saveChanges <number>`: Sets the number of changes after which the database is automatically saved (default: `1000`).
+*   `bufferSize <number>`: Sets the size of the client input buffer in bytes (default: `1024`).
+*   `maxEvents <number>`: Sets the maximum number of events to be processed by the event loop at once (default: `64`).
 
 ## Connect to Running Server
 
@@ -146,7 +177,7 @@ GET mykey
 
 ## Implementation Details
 
--   Multi-threaded architecture for handling client connections
+-   **Configurable Concurrency:** Supports both a multi-threaded (thread-per-client) and a high-performance single-threaded event-loop (using `epoll`) architecture.
 -   Dual-stack IPv4/IPv6 networking implementation
 -   LRU cache eviction algorithm for memory management
 -   Fork-based background saving for non-blocking persistence
