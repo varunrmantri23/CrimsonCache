@@ -2,6 +2,8 @@
 
 CrimsonCache is a custom in-memory data store inspired by Redis, offering essential caching commands, data persistence, and replication. It's built as a robust learning tool for exploring networking, concurrency, and distributed systems.
 
+<img src="./Images/CrimsonCache.jpg"/>
+
 ## Features
 
 -   **Core Functionality**
@@ -43,7 +45,7 @@ CrimsonCache is a custom in-memory data store inspired by Redis, offering essent
 ### Installation
 
 ```bash
-git clone https://github.com/yourusername/CrimsonCache.git
+git clone https://github.com/varunrmantri23/CrimsonCache.git
 cd CrimsonCache
 make
 ```
