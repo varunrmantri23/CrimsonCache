@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include "crimsoncache.h"
 #include "transaction.h" 
+#include "pubsub.h"
 
 extern void track_command_change(void);
 extern volatile sig_atomic_t server_running;
@@ -61,6 +62,9 @@ static command_def commands[] = {
     {"multi", multi_command, 1, 1},
     {"exec", exec_command, 1, 1},
     {"discard", discard_command, 1, 1},
+    {"subscribe", subscribe_command, 2, -1},
+    {"unsubscribe", unsubscribe_command, 1, -1},
+    {"publish", publish_command, 3, 3},  
     {NULL, NULL, 0, 0}  // sentinel to mark end of array
 };
 
@@ -244,7 +248,7 @@ cmd_result execute_command(int client_sock, char *input, dict *db) {
     if (client && client->in_transaction && !is_tx_command) {
         // use the original input string for queuing to preserve quotes and stuff
         if (tx_queue_command(client, input)) {
-            reply_string(client_sock, "queued");
+            reply_string(client_sock, "QUEUED");
         } else {
             reply_error(client_sock, "err queue command failed");
             client->transaction_errors = 1; // mark that something went wrong
@@ -742,6 +746,47 @@ cmd_result discard_command(int client_sock, int argc, char **argv, dict *db) {
     }
     
     tx_discard_commands(client);
+    reply_string(client_sock, "OK");
+    return CMD_OK;
+}
+
+// subscribe command
+cmd_result subscribe_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)db; // unused
+    client_t *client = get_client_by_socket(client_sock);
+    if (!client) {
+        reply_error(client_sock, "err client not found for subscribe");
+        return CMD_ERR;
+    }
+    // the pubsub_subscribe_client function sends its own replies
+    pubsub_subscribe_client(client, argc, argv);
+    return CMD_OK; // command itself is ok, replies handled by pubsub_subscribe_client
+}
+
+// unsubscribe command
+cmd_result unsubscribe_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)db; // unused
+    client_t *client = get_client_by_socket(client_sock);
+    if (!client) {
+        reply_error(client_sock, "err client not found for unsubscribe");
+        return CMD_ERR;
+    }
+    // the pubsub_unsubscribe_client function sends its own replies
+    pubsub_unsubscribe_client(client, argc, argv);
+    return CMD_OK;
+}
+
+// publish command
+cmd_result publish_command(int client_sock, int argc, char **argv, dict *db) {
+    (void)db; // unused
+    if (argc != 3) {
+        reply_error(client_sock, "err wrong number of arguments for 'publish' command");
+        return CMD_ERR;
+    }
+    const char *channel_name = argv[1];
+    const char *message = argv[2];
+    int receivers = pubsub_publish_message(channel_name, message);
+    reply_integer(client_sock, receivers);
     return CMD_OK;
 }
 

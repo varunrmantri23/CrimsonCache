@@ -58,5 +58,8 @@ cmd_result replconf_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result multi_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result exec_command(int client_sock, int argc, char **argv, dict *db);
 cmd_result discard_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result subscribe_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result unsubscribe_command(int client_sock, int argc, char **argv, dict *db);
+cmd_result publish_command(int client_sock, int argc, char **argv, dict *db);
 
 #endif /* COMMANDS_H */
