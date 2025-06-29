@@ -1,8 +1,9 @@
+<p align="center">
+  <img src="./Images/CrimsonCache.jpg" width="450" alt="CrimsonCache Logo" />
+</p>
+
 # CrimsonCache
-
 CrimsonCache is a custom in-memory data store inspired by Redis, offering essential caching commands, data persistence, and replication. It's built as a robust learning tool for exploring networking, concurrency, and distributed systems.
-
-<img src="./Images/CrimsonCache.jpg"/>
 
 ## Features
 
