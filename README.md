@@ -1,9 +1,10 @@
 <p align="center">
-  <img src="./Images/CrimsonCache.jpg" width="450" alt="CrimsonCache Logo" />
+  <img src="./Images/CrimsonCache.png" width="700" alt="CrimsonCache Logo" />
+    <p align="center">
+        CrimsonCache is a custom in-memory data store inspired by Redis, offering essential caching commands, data persistence, and replication. It's built as a robust learning tool for exploring networking, concurrency, and distributed systems.
+    </p>
 </p>
 
-# CrimsonCache
-CrimsonCache is a custom in-memory data store inspired by Redis, offering essential caching commands, data persistence, and replication. It's built as a robust learning tool for exploring networking, concurrency, and distributed systems.
 
 ## Features
 
@@ -185,6 +186,30 @@ GET mykey
 -   LRU cache eviction algorithm for memory management
 -   Fork-based background saving for non-blocking persistence
 -   Properly handles quoted strings in commands
+
+### Transitioning to the Event Loop Model
+
+The Problem with Threaded Concurrency: While easy to implement, the thread-per-client model (where each client connection gets its own dedicated thread) does not scale efficiently for a high number of concurrent connections. Each thread consumes significant memory and CPU resources, leading to excessive context switching overhead as the number of clients grows. This limits the server's ability to handle many clients simultaneously without performance degradation.
+
+The Solution: Event Loop with epoll: To overcome these limitations, CrimsonCache was refactored to support an event loop concurrency model, leveraging epoll on Linux. This approach allows a single thread to manage thousands of concurrent connections efficiently by using non-blocking I/O.
+
+Instead of removing the threaded logic, I have added option to manually set config
+
+
+## Contribution
+
+Contributions are welcome and greatly appreciated! This project was built as a learning tool, and any improvements that can help others learn are fantastic.
+
+If you find any bugs, have a feature request, or want to contribute code, please feel free to:
+
+1.  **Open an Issue**: If you find a bug or have a suggestion for a new feature, please open an issue first to discuss it. This helps ensure that your work aligns with the project's goals.
+2.  **Fork the Repository**: Create your own copy of the repository to work on.
+3.  **Create a Feature Branch**: Create a new branch for your changes (`git checkout -b feature/AmazingFeature`).
+4.  **Commit Your Changes**: Make your changes and commit them with a clear and descriptive message (`git commit -m 'feat: add some amazing feature'`).
+5.  **Push to the Branch**: Push your changes to your forked repository (`git push origin feature/AmazingFeature`).
+6.  **Open a Pull Request**: Open a pull request from your branch to the main repository's `main` branch.
+
+Please make sure your code follows the existing style and that you've tested your changes. Thank you for helping make CrimsonCache better!
 
 ## License
 
